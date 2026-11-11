@@ -1,0 +1,19 @@
+{
+  "name": "og8oh-muse-hybrid-superagent-v3",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Reviewable Base deployment workflow and dossier for MuSe Hybrid SuperAgent V3.",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:base": "hardhat run scripts/base-deployer.js --network base"
+  },
+  "engines": { "node": ">=20 <23" },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.2"
+  }
+}

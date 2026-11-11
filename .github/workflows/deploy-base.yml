@@ -1,0 +1,62 @@
+name: Deploy MuSeHybridSuperAgentV3 to Base Mainnet
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_mainnet:
+        description: Type DEPLOY to authorize the Base Mainnet deployment step
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CHAIN_ID: 8453
+  UI_URI: https://og8oh.omegaportal.example/ui
+  MCP_ENDPOINT: https://og8oh.omegaportal.example/mcp
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Compile contract
+        run: npx hardhat compile
+      - name: Run full test suite
+        run: npx hardhat test
+
+  deploy:
+    needs: test
+    if: ${{ inputs.confirm_mainnet == 'DEPLOY' }}
+    runs-on: ubuntu-latest
+    environment: base-mainnet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Compile again in deploy job
+        run: npx hardhat compile
+      - name: Deploy with chain and confirmation guards
+        env:
+          RPC_URL: ${{ secrets.RPC_URL }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          DEPLOY_CONFIRM: YES
+        run: npx hardhat run scripts/base-deployer.js --network base
+      - name: Verify on BaseScan
+        if: ${{ success() }}
+        env:
+          BASESCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+        run: echo "Run verification with the reviewed deployment address from the deployment artifact."
+        # Replace this placeholder only after the deploy script writes a signed artifact.
+        # npx hardhat verify --network base <DEPLOYED_ADDRESS> "$UI_URI" "$MCP_ENDPOINT"
