@@ -1,7 +1,18 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const required = ["address", "transactionHash", "block", "timestamp", "chainId"];
+const required = [
+  "address",
+  "transactionHash",
+  "block",
+  "timestamp",
+  "chainId",
+  "registry",
+  "accountImplementation",
+  "entryPoint",
+  "voiceVerifier",
+  "voiceVerifierTransactionHash"
+];
 const report = JSON.parse(fs.readFileSync(process.argv[2] || 0, "utf8"));
 for (const key of required) {
   if (report[key] === undefined || report[key] === null || report[key] === "") {

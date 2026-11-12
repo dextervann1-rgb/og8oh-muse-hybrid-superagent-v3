@@ -10,6 +10,12 @@ The HTML artifact is a polished, self-contained React/Tailwind presentation and 
 
 The embedded blockchain artifacts should be treated as **drafts**, not production deployment code. The most important blockers are the mixed OpenZeppelin version conventions, an incomplete ERC-4337 `UserOperation` interface, an unverified ERC-6551 implementation/registry integration, and a `verifySuperiorVoice` function that does not cryptographically verify the supplied proof.
 
+## Remediation update — 2026-11-11
+
+The critical code blockers have been addressed in the public repository's hardened draft. OpenZeppelin is pinned exactly to 5.0.2 with v5 import paths; the ERC-4337 operation includes `paymasterAndData`; ERC-6551 registry and account implementation addresses are explicit constructor inputs and are required to have deployed code; voice verification uses a configured ECDSA verifier, domain-bound digest, and replay protection; and ERC-4337 execution is scoped to a specific agent account. The local Hardhat gate now compiles successfully and seven security-focused tests pass.
+
+The deployment is still blocked at the live-chain approval layer. The exact Base addresses for the registry, account implementation, EntryPoint, and verifier must be independently verified, the external contracts must be integration-tested on the target chain, and an independent Solidity review is still required. The original findings below remain as the rationale and release gates; they are not a claim that Base Mainnet deployment is complete.
+
 ## Findings
 
 ### Critical — do not deploy yet

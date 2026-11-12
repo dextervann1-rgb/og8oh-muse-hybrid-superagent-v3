@@ -51,8 +51,20 @@ jobs:
         env:
           RPC_URL: ${{ secrets.RPC_URL }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          REGISTRY_ADDRESS: ${{ secrets.REGISTRY_ADDRESS }}
+          ACCOUNT_IMPLEMENTATION: ${{ secrets.ACCOUNT_IMPLEMENTATION }}
+          ENTRY_POINT_ADDRESS: ${{ secrets.ENTRY_POINT_ADDRESS }}
+          VOICE_VERIFIER_ADDRESS: ${{ secrets.VOICE_VERIFIER_ADDRESS }}
+          DEPLOYMENT_OUTPUT_PATH: deployment-output.json
           DEPLOY_CONFIRM: YES
         run: npx hardhat run scripts/base-deployer.js --network base
+      - name: Validate deployment report
+        run: node scripts/write-deployment-report.js deployment-output.json
+      - name: Upload deployment report
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-deployment-report
+          path: deployment-report.json
       - name: Verify on BaseScan
         if: ${{ success() }}
         env:
