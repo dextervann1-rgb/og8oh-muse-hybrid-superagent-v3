@@ -6,6 +6,7 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
+    "dry-run:base-sepolia": "EXPECTED_CHAIN_ID=84532 DRY_RUN=YES hardhat run scripts/base-deployer.js --network baseSepolia",
     "deploy:base": "hardhat run scripts/base-deployer.js --network base"
   },
   "engines": { "node": ">=20 <23" },

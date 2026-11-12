@@ -2,6 +2,8 @@
 
 The intended flow is a protected GitHub Actions workflow for Base Mainnet, chain ID 8453.
 
+Before any live deployment, `npm run dry-run:base-sepolia` can be used against Base Sepolia, chain ID 84532. It reads the live RPC chain ID and latest block, reports whether the deployment configuration is complete, and exits with `transactionsSent: 0`; dry-run mode never loads a signer or calls a contract deployment method.
+
 A maintainer starts the workflow manually and enters `DEPLOY`. The test job installs pinned dependencies, compiles the selected contract, and runs the complete Hardhat suite. The deploy job cannot start unless that job is green and the protected `base-mainnet` environment approves it.
 
 The deploy script checks `DEPLOY_CONFIRM=YES`, verifies the provider chain ID is 8453, requires `PRIVATE_KEY`, `UI_URI`, `MCP_ENDPOINT`, `REGISTRY_ADDRESS`, `ACCOUNT_IMPLEMENTATION`, `ENTRY_POINT_ADDRESS`, and `VOICE_VERIFIER_ADDRESS`, submits the deployment, configures the trusted verifier, waits for both receipts, and emits a JSON record containing the contract address, deployment and verifier transaction hashes, block number, chain ID, integration addresses, URIs, and UTC timestamp.

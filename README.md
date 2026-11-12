@@ -8,6 +8,8 @@ The repository is intentionally **not production-approved yet**. The critical co
 
 Deployment is manual-only through GitHub Actions. A maintainer must enter `DEPLOY`, the compile and full Hardhat suite must pass, and the protected `base-mainnet` environment must approve the deploy job. The deployer checks `DEPLOY_CONFIRM=YES`, validates Base chain ID 8453, requires runtime secrets for the registry, account implementation, EntryPoint, and trusted voice verifier, configures that verifier, waits for both receipts, and emits the address, transaction hashes, block number, timestamp, chain ID, and configured integration addresses.
 
+The separate `Dry Run Base Sepolia Deployment` workflow is also manual-only. It runs the same compile/test gate, reads Base Sepolia chain ID 84532 and the latest block through `https://sepolia.base.org`, reports missing configuration, and asserts `transactionsSent: 0`. It does not load a signer or broadcast a transaction.
+
 The post-deploy stage is designed to verify on BaseScan, write a durable JSON deployment report, append the record to the S-C Storage Agent log, pin the report to IPFS, update the Base Grants R2 proof page, and alert after two failed retries. Those external integrations are deliberately left as explicit implementation gates rather than represented as completed by placeholder shell commands.
 
 ## Repository contents
