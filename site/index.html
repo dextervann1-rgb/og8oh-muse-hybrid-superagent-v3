@@ -1674,34 +1674,63 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 interface IERC6551Registry {
-    function createAccount(address implementation, uint256 chainId, address tokenContract, uint256 tokenId, uint256 salt, bytes calldata initData) external returns (address);
-    function account(address implementation, uint256 chainId, address tokenContract, uint256 tokenId, uint256 salt) external view returns (address);
+    function createAccount(
+        address implementation,
+        uint256 chainId,
+        address tokenContract,
+        uint256 tokenId,
+        uint256 salt,
+        bytes calldata initData
+    ) external returns (address);
+
+    function account(
+        address implementation,
+        uint256 chainId,
+        address tokenContract,
+        uint256 tokenId,
+        uint256 salt
+    ) external view returns (address);
+}
+
+struct UserOperation {
+    address sender;
+    uint256 nonce;
+    bytes initCode;
+    bytes callData;
+    uint256 callGasLimit;
+    uint256 verificationGasLimit;
+    uint256 preVerificationGas;
+    uint256 maxFeePerGas;
+    uint256 maxPriorityFeePerGas;
+    bytes paymasterAndData;
+    bytes signature;
 }
 
 interface IEntryPoint {
     function handleOps(UserOperation[] calldata ops, address payable beneficiary) external;
 }
 
-struct UserOperation {
-    address sender; uint256 nonce; bytes initCode; bytes callData;
-    uint256 callGasLimit; uint256 verificationGasLimit; uint256 preVerificationGas;
-    uint256 maxFeePerGas; uint256 maxPriorityFeePerGas; bytes signature;
-}
-
 /// @title MuSeHybridSuperAgentV3
-/// @notice ERC-721 sovereign agent with ERC-6551 identity, ERC-4337 execution,
-///         fused voice + compression, and owner-controlled pause / safety rails.
+/// @notice ERC-721 identity with parameterized ERC-6551 and ERC-4337 integrations.
+/// @dev The configured external contracts must be independently verified for the target chain.
 contract MuSeHybridSuperAgentV3 is ERC721, Ownable, Pausable, ReentrancyGuard {
-    IERC6551Registry public constant REGISTRY = IERC6551Registry(0x000000006551c19487814612e58FE068137A5fF6a14B);
-    IEntryPoint public immutable ENTRY_POINT = IEntryPoint(0x5FF137D4b0FDCD49DcA30c7CF57E578a026d278a);
+    using ECDSA for bytes32;
+    using MessageHashUtils for bytes32;
+
+    IERC6551Registry public immutable registry;
+    address public immutable accountImplementation;
+    IEntryPoint public immutable entryPoint;
 
     uint256 public nextId = 1;
     string public uiURI;
     string public mcpEndpoint;
+    address public voiceVerifier;
 
     struct HybridAgent {
         string name;
@@ -1716,21 +1745,46 @@ contract MuSeHybridSuperAgentV3 is ERC721, Ownable, Pausable, ReentrancyGuard {
 
     mapping(uint256 => HybridAgent) public agents;
     mapping(bytes32 => bool) public usedVoiceHashes;
+    mapping(bytes32 => bool) public usedVerificationDigests;
 
     event AgentFused(uint256 indexed tokenId, address indexed account, string name);
-    event VoiceVerified(uint256 indexed tokenId, bytes32 voiceHash);
+    event VoiceVerifierUpdated(address indexed verifier);
+    event VoiceVerified(uint256 indexed tokenId, bytes32 voiceHash, bytes32 indexed verificationDigest);
     event ExecutedVia4337(uint256 indexed tokenId, address indexed sender, bytes32 operationHash);
     event ConfigUpdated(string uiURI, string mcpEndpoint);
 
-    constructor(string memory _uiURI, string memory _mcpEndpoint)
-        ERC721("MuSe Hybrid SuperAgent", "MuSeV3") Ownable(msg.sender) {
+    constructor(
+        string memory _uiURI,
+        string memory _mcpEndpoint,
+        address _registry,
+        address _accountImplementation,
+        address _entryPoint
+    ) ERC721("MuSe Hybrid SuperAgent", "MuSeV3") Ownable(msg.sender) {
+        require(bytes(_uiURI).length > 0, "ui URI required");
+        require(bytes(_mcpEndpoint).length > 0, "MCP endpoint required");
+        require(_registry.code.length > 0, "registry has no code");
+        require(_accountImplementation.code.length > 0, "account implementation has no code");
+        require(_entryPoint.code.length > 0, "entry point has no code");
+
         uiURI = _uiURI;
         mcpEndpoint = _mcpEndpoint;
+        registry = IERC6551Registry(_registry);
+        accountImplementation = _accountImplementation;
+        entryPoint = IEntryPoint(_entryPoint);
     }
 
     function setConfig(string calldata _uiURI, string calldata _mcpEndpoint) external onlyOwner {
-        uiURI = _uiURI; mcpEndpoint = _mcpEndpoint;
+        require(bytes(_uiURI).length > 0, "ui URI required");
+        require(bytes(_mcpEndpoint).length > 0, "MCP endpoint required");
+        uiURI = _uiURI;
+        mcpEndpoint = _mcpEndpoint;
         emit ConfigUpdated(_uiURI, _mcpEndpoint);
+    }
+
+    function setVoiceVerifier(address verifier) external onlyOwner {
+        require(verifier != address(0), "verifier required");
+        voiceVerifier = verifier;
+        emit VoiceVerifierUpdated(verifier);
     }
 
     function fuseHybridAgent(
@@ -1743,33 +1797,75 @@ contract MuSeHybridSuperAgentV3 is ERC721, Ownable, Pausable, ReentrancyGuard {
         require(voiceHash != bytes32(0), "voice required");
         require(!usedVoiceHashes[voiceHash], "voice already fused");
 
-        tokenId = nextId;
-        nextId = tokenId + 1;
+        tokenId = nextId++;
         usedVoiceHashes[voiceHash] = true;
-
         _safeMint(msg.sender, tokenId);
-        account = REGISTRY.createAccount(address(this), block.chainid, address(this), tokenId, salt, "");
+
+        account = registry.createAccount(
+            accountImplementation,
+            block.chainid,
+            address(this),
+            tokenId,
+            salt,
+            ""
+        );
+        require(account != address(0), "account creation failed");
+
         agents[tokenId] = HybridAgent({
-            name: name, uiURI: uiURI, mcpEndpoint: mcpEndpoint,
-            voiceHash: voiceHash, compressedProof: compressedProof,
-            account: account, superiorVoice: false, fusedAt: block.timestamp
+            name: name,
+            uiURI: uiURI,
+            mcpEndpoint: mcpEndpoint,
+            voiceHash: voiceHash,
+            compressedProof: compressedProof,
+            account: account,
+            superiorVoice: false,
+            fusedAt: block.timestamp
         });
         emit AgentFused(tokenId, account, name);
     }
 
-    function verifySuperiorVoice(uint256 tokenId, bytes32 voiceHash, bytes calldata proof) external whenNotPaused returns (bool) {
+    function verificationDigest(
+        uint256 tokenId,
+        bytes32 voiceHash,
+        bytes32 proofHash
+    ) public view returns (bytes32) {
+        return keccak256(abi.encode(address(this), block.chainid, tokenId, voiceHash, proofHash));
+    }
+
+    function verifySuperiorVoice(
+        uint256 tokenId,
+        bytes32 voiceHash,
+        bytes calldata proof,
+        bytes calldata signature
+    ) external whenNotPaused returns (bool) {
         require(_ownerOf(tokenId) != address(0), "agent missing");
         require(agents[tokenId].voiceHash == voiceHash, "voice mismatch");
-        require(proof.length > 0 && keccak256(proof) != bytes32(0), "proof required");
+        require(proof.length > 0, "proof required");
+        require(voiceVerifier != address(0), "verifier not configured");
+
+        bytes32 digest = verificationDigest(tokenId, voiceHash, keccak256(proof));
+        require(!usedVerificationDigests[digest], "proof already used");
+        require(digest.toEthSignedMessageHash().recover(signature) == voiceVerifier, "invalid verifier signature");
+
+        usedVerificationDigests[digest] = true;
         agents[tokenId].superiorVoice = true;
-        emit VoiceVerified(tokenId, voiceHash);
+        emit VoiceVerified(tokenId, voiceHash, digest);
         return true;
     }
 
-    function executeVia4337(UserOperation[] calldata ops, address payable beneficiary) external onlyOwner whenNotPaused nonReentrant returns (bool) {
+    function executeVia4337(
+        uint256 tokenId,
+        UserOperation[] calldata ops,
+        address payable beneficiary
+    ) external onlyOwner whenNotPaused nonReentrant returns (bool) {
+        require(_ownerOf(tokenId) != address(0), "agent missing");
         require(ops.length > 0, "no operations");
-        ENTRY_POINT.handleOps(ops, beneficiary);
-        emit ExecutedVia4337(0, msg.sender, keccak256(abi.encode(ops)));
+        address expectedSender = agents[tokenId].account;
+        for (uint256 i = 0; i < ops.length; i++) {
+            require(ops[i].sender == expectedSender, "operation sender mismatch");
+        }
+        entryPoint.handleOps(ops, beneficiary);
+        emit ExecutedVia4337(tokenId, msg.sender, keccak256(abi.encode(ops)));
         return true;
     }
 
@@ -1782,14 +1878,20 @@ contract MuSeHybridSuperAgentV3 is ERC721, Ownable, Pausable, ReentrancyGuard {
         ));
     }
 
-    function getAgent(uint256 tokenId) external view returns (HybridAgent memory) { return agents[tokenId]; }
+    function getAgent(uint256 tokenId) external view returns (HybridAgent memory) {
+        return agents[tokenId];
+    }
+
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
+
     function _toString(uint256 v) internal pure returns (string memory) {
         if (v == 0) return "0";
-        uint256 j = v; uint256 len;
+        uint256 j = v;
+        uint256 len;
         while (j != 0) { len++; j /= 10; }
-        bytes memory b = new bytes(len); uint256 k = len;
+        bytes memory b = new bytes(len);
+        uint256 k = len;
         while (v != 0) { k--; b[k] = bytes1(uint8(48 + v % 10)); v /= 10; }
         return string(b);
     }
@@ -1797,49 +1899,124 @@ contract MuSeHybridSuperAgentV3 is ERC721, Ownable, Pausable, ReentrancyGuard {
 `,Xm=`const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
+const UI_URI = "https://og8oh.example/ui";
+const MCP_ENDPOINT = "https://og8oh.example/mcp";
+
+function operation(sender) {
+  return {
+    sender,
+    nonce: 0,
+    initCode: "0x",
+    callData: "0x",
+    callGasLimit: 100000,
+    verificationGasLimit: 100000,
+    preVerificationGas: 21000,
+    maxFeePerGas: 1,
+    maxPriorityFeePerGas: 1,
+    paymasterAndData: "0x",
+    signature: "0x"
+  };
+}
+
 describe("MuSeHybridSuperAgentV3", function () {
-  let agent, owner, user;
-  const uiURI = "https://og8oh.omegaportal.example/ui";
-  const mcp = "https://og8oh.omegaportal.example/mcp";
+  let agent;
+  let owner;
+  let user;
+  let verifier;
+  let accountImplementation;
+  let registry;
+  let entryPoint;
 
   beforeEach(async () => {
-    [owner, user] = await ethers.getSigners();
-    agent = await ethers.deployContract("MuSeHybridSuperAgentV3", [uiURI, mcp]);
+    [owner, user, verifier] = await ethers.getSigners();
+    accountImplementation = await ethers.deployContract("MockAccountImplementation");
+    registry = await ethers.deployContract("MockERC6551Registry");
+    entryPoint = await ethers.deployContract("MockEntryPoint");
+    agent = await ethers.deployContract("MuSeHybridSuperAgentV3", [
+      UI_URI,
+      MCP_ENDPOINT,
+      registry.target,
+      accountImplementation.target,
+      entryPoint.target
+    ]);
+    await agent.setVoiceVerifier(verifier.address);
   });
 
-  it("starts nextId at 1 and stores name / uiURI / mcpEndpoint", async () => {
+  it("starts at token 1, stores config, and pins integration addresses", async () => {
     expect(await agent.nextId()).to.equal(1);
-    expect(await agent.uiURI()).to.equal(uiURI);
-    expect(await agent.mcpEndpoint()).to.equal(mcp);
+    expect(await agent.uiURI()).to.equal(UI_URI);
+    expect(await agent.mcpEndpoint()).to.equal(MCP_ENDPOINT);
+    expect(await agent.registry()).to.equal(registry.target);
+    expect(await agent.accountImplementation()).to.equal(accountImplementation.target);
+    expect(await agent.entryPoint()).to.equal(entryPoint.target);
   });
 
-  it("fuses + compresses: 1000 -> compact proof", async () => {
-    const proof = ethers.solidityPackedKeccak256(["uint256"], [1000]);
-    await agent.fuseHybridAgent("MuSe One", ethers.keccak256(ethers.toUtf8Bytes("voice-1")), proof, 1);
+  it("fuses an agent and creates an account through the configured registry", async () => {
+    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-1"));
+    await agent.fuseHybridAgent("MuSe One", voice, ethers.ZeroHash, 1);
     const record = await agent.getAgent(1);
-    expect(record.compressedProof).to.equal(proof);
+    expect(record.account).to.equal(accountImplementation.target);
+    expect(await agent.ownerOf(1)).to.equal(owner.address);
     expect(await agent.nextId()).to.equal(2);
   });
 
-  it("mints an ERC-721 agent", async () => {
-    await agent.fuseHybridAgent("Aegis", ethers.keccak256(ethers.toUtf8Bytes("voice-2")), ethers.ZeroHash, 2);
-    expect(await agent.ownerOf(1)).to.equal(owner.address);
+  it("rejects duplicate voice hashes and empty identity inputs", async () => {
+    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-1"));
+    await expect(agent.fuseHybridAgent("", voice, ethers.ZeroHash, 1)).to.be.revertedWith("name required");
+    await agent.fuseHybridAgent("Aegis", voice, ethers.ZeroHash, 1);
+    await expect(agent.fuseHybridAgent("Again", voice, ethers.ZeroHash, 2)).to.be.revertedWith("voice already fused");
   });
 
-  it("verifies a superior voice", async () => {
-    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-3"));
+  it("requires a verifier signature and prevents proof replay", async () => {
+    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-2"));
+    const proof = ethers.toUtf8Bytes("voice-proof-v1");
     await agent.fuseHybridAgent("Sovereign", voice, ethers.ZeroHash, 3);
-    await expect(agent.verifySuperiorVoice(1, voice, "0x1234")).to.emit(agent, "VoiceVerified");
+
+    const network = await ethers.provider.getNetwork();
+    const proofHash = ethers.keccak256(proof);
+    const digest = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "uint256", "uint256", "bytes32", "bytes32"],
+      [agent.target, network.chainId, 1, voice, proofHash]
+    ));
+    const signature = await verifier.signMessage(ethers.getBytes(digest));
+
+    await expect(agent.connect(user).verifySuperiorVoice(1, voice, proof, signature))
+      .to.emit(agent, "VoiceVerified");
     expect((await agent.getAgent(1)).superiorVoice).to.equal(true);
+    await expect(agent.connect(user).verifySuperiorVoice(1, voice, proof, signature))
+      .to.be.revertedWith("proof already used");
   });
 
-  it("pauses fusion", async () => {
+  it("rejects signatures from the wrong verifier", async () => {
+    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-3"));
+    const proof = ethers.toUtf8Bytes("voice-proof-v2");
+    await agent.fuseHybridAgent("Aegis", voice, ethers.ZeroHash, 4);
+    const network = await ethers.provider.getNetwork();
+    const digest = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "uint256", "uint256", "bytes32", "bytes32"],
+      [agent.target, network.chainId, 1, voice, ethers.keccak256(proof)]
+    ));
+    const badSignature = await user.signMessage(ethers.getBytes(digest));
+    await expect(agent.verifySuperiorVoice(1, voice, proof, badSignature))
+      .to.be.revertedWith("invalid verifier signature");
+  });
+
+  it("scopes ERC-4337 execution to the agent account and owner", async () => {
+    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-4"));
+    await agent.fuseHybridAgent("Executor", voice, ethers.ZeroHash, 5);
+    await expect(agent.connect(user).executeVia4337(1, [operation(accountImplementation.target)], owner.address))
+      .to.be.reverted;
+    await expect(agent.executeVia4337(1, [operation(user.address)], owner.address))
+      .to.be.revertedWith("operation sender mismatch");
+    await agent.executeVia4337(1, [operation(accountImplementation.target)], owner.address);
+    expect(await entryPoint.handledOperations()).to.equal(1);
+  });
+
+  it("pauses fusion and voice verification", async () => {
     await agent.pause();
-    await expect(agent.fuseHybridAgent("Paused", ethers.ZeroHash, ethers.ZeroHash, 4)).to.be.reverted;
-  });
-
-  it("only owner can call ERC-4337 execution", async () => {
-    await expect(agent.connect(user).executeVia4337([], owner.address)).to.be.reverted;
+    const voice = ethers.keccak256(ethers.toUtf8Bytes("voice-5"));
+    await expect(agent.fuseHybridAgent("Paused", voice, ethers.ZeroHash, 6)).to.be.reverted;
+    await expect(agent.verifySuperiorVoice(1, voice, "0x01", "0x01")).to.be.reverted;
   });
 });
 `,Zm=`AI STUDIO — OG8OH OMEGAPORTAL OS : ARE YOU FOR REAL? v3
@@ -1858,24 +2035,81 @@ SETUP INSTRUCTIONS:
 5. Show the v3 contract summary before any deployment step.
 6. Keep Base chain ID 8453 as the only production network in this flow.
 7. Save a local draft. Do not publish until the Hardhat suite is green.
-`,qm=`// base-deployer.js — local deploy + verify draft
+`,qm=`const fs = require("node:fs");
+const path = require("node:path");
 const hre = require("hardhat");
 
-async function main() {
-  const uiURI = process.env.UI_URI || "https://og8oh.omegaportal.example/ui";
-  const mcpEndpoint = process.env.MCP_ENDPOINT || "https://og8oh.omegaportal.example/mcp";
-  const Agent = await hre.ethers.getContractFactory("MuSeHybridSuperAgentV3");
-  const agent = await Agent.deploy(uiURI, mcpEndpoint);
-  await agent.waitForDeployment();
-  console.log("MuSeHybridSuperAgentV3:", await agent.getAddress());
-  console.log("nextId:", await agent.nextId());
+const BASE_MAINNET_CHAIN_ID = 8453n;
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required`);
+  return value;
 }
 
-main().catch((e) => { console.error(e); process.exitCode = 1; });
+async function main() {
+  if (process.env.DEPLOY_CONFIRM !== "YES") {
+    throw new Error("Refusing deployment: set DEPLOY_CONFIRM=YES only after review and a green test run.");
+  }
 
-// VERIFY ON BASE (8453)
-// npx hardhat verify --network base <DEPLOYED_ADDRESS> "<UI_URI>" "<MCP_ENDPOINT>"
-// npx hardhat run scripts/base-deployer.js --network base
+  const network = await hre.ethers.provider.getNetwork();
+  if (network.chainId !== BASE_MAINNET_CHAIN_ID) {
+    throw new Error(`Refusing deployment: expected Base Mainnet (8453), got ${network.chainId}`);
+  }
+
+  requireEnv("PRIVATE_KEY");
+  const uiURI = requireEnv("UI_URI");
+  const mcpEndpoint = requireEnv("MCP_ENDPOINT");
+  const registry = requireEnv("REGISTRY_ADDRESS");
+  const accountImplementation = requireEnv("ACCOUNT_IMPLEMENTATION");
+  const entryPoint = requireEnv("ENTRY_POINT_ADDRESS");
+  const voiceVerifier = requireEnv("VOICE_VERIFIER_ADDRESS");
+
+  const [deployer] = await hre.ethers.getSigners();
+  const balance = await hre.ethers.provider.getBalance(deployer.address);
+  console.log(`Deployer: ${deployer.address}`);
+  console.log(`Balance: ${hre.ethers.formatEther(balance)} ETH`);
+
+  const Agent = await hre.ethers.getContractFactory("MuSeHybridSuperAgentV3");
+  const agent = await Agent.deploy(uiURI, mcpEndpoint, registry, accountImplementation, entryPoint);
+  const deploymentTx = agent.deploymentTransaction();
+  await agent.waitForDeployment();
+  const verifierTx = await agent.setVoiceVerifier(voiceVerifier);
+  await verifierTx.wait();
+
+  const address = await agent.getAddress();
+  const receipt = deploymentTx ? await deploymentTx.wait() : null;
+  const record = {
+    contract: "MuSeHybridSuperAgentV3",
+    address,
+    transactionHash: deploymentTx?.hash ?? null,
+    block: receipt?.blockNumber ?? null,
+    chainId: Number(network.chainId),
+    deployer: deployer.address,
+    uiURI,
+    mcpEndpoint,
+    registry,
+    accountImplementation,
+    entryPoint,
+    voiceVerifier,
+    voiceVerifierTransactionHash: verifierTx.hash,
+    timestamp: new Date().toISOString()
+  };
+
+  const outputPath = process.env.DEPLOYMENT_OUTPUT_PATH;
+  if (outputPath) {
+    const resolved = path.resolve(outputPath);
+    fs.writeFileSync(resolved, JSON.stringify(record, null, 2) + "
+");
+    console.log(`Deployment record: ${resolved}`);
+  }
+  console.log(JSON.stringify(record, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exitCode = 1;
+});
 `,Jm=[["#hero","Hero"],["#contract","v3 Contract"],["#tests","Hardhat Tests"],["#grants","Base Grants R2"],["#studio","AI Studio"],["#deploy","Android + Deployer"],["#pricing","Price Tiers"],["#manus","Manus Workflow"]],bm=`Build me an Automated Workflow for Autonomous Smart Contract Deployment on Base Mainnet for OG8OH Omegaportal OS.
 
 PROJECT: MuSeHybridSuperAgentV3.sol
@@ -1897,61 +2131,80 @@ STACK: Hardhat, ethers.js, Base RPC https://mainnet.base.org, BaseScan API.
 SECURITY: Ownable, Pausable, ReentrancyGuard. No private keys in code. GitHub Secrets only.
 
 DELIVER: GitHub Actions workflow + deploy script + verification report.
-`,jm=`# .github/workflows/deploy-base.yml
-name: Deploy MuSeHybridSuperAgentV3 to Base Mainnet
+`,jm=`name: Deploy MuSeHybridSuperAgentV3 to Base Mainnet
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      confirm_mainnet:
+        description: Type DEPLOY to authorize the Base Mainnet deployment step
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-jobs:
-  deploy-base:
-    runs-on: ubuntu-latest
-    environment: base-mainnet
-    env:
-      RPC_URL: \${{ secrets.RPC_URL }}
-      BASESCAN_API_KEY: \${{ secrets.BASESCAN_API_KEY }}
-      UI_URI: https://og8oh.omegaportal.example/ui
-      MCP_ENDPOINT: https://og8oh.omegaportal.example/mcp
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+env:
+  CHAIN_ID: 8453
+  UI_URI: https://og8oh.omegaportal.example/ui
+  MCP_ENDPOINT: https://og8oh.omegaportal.example/mcp
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-
       - name: Install dependencies
         run: npm ci
-
       - name: Compile contract
         run: npx hardhat compile
-
-      - name: Run Hardhat tests — must pass before deploy
+      - name: Run full test suite
         run: npx hardhat test
 
-      - name: Deploy to Base Mainnet (8453)
+  deploy:
+    needs: test
+    if: ${{ inputs.confirm_mainnet == 'DEPLOY' }}
+    runs-on: ubuntu-latest
+    environment: base-mainnet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Compile again in deploy job
+        run: npx hardhat compile
+      - name: Deploy with chain and confirmation guards
         env:
-          PRIVATE_KEY: \${{ secrets.PRIVATE_KEY }}
-        run: node base-deployer.js
-
+          RPC_URL: ${{ secrets.RPC_URL }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          REGISTRY_ADDRESS: ${{ secrets.REGISTRY_ADDRESS }}
+          ACCOUNT_IMPLEMENTATION: ${{ secrets.ACCOUNT_IMPLEMENTATION }}
+          ENTRY_POINT_ADDRESS: ${{ secrets.ENTRY_POINT_ADDRESS }}
+          VOICE_VERIFIER_ADDRESS: ${{ secrets.VOICE_VERIFIER_ADDRESS }}
+          DEPLOYMENT_OUTPUT_PATH: deployment-output.json
+          DEPLOY_CONFIRM: YES
+        run: npx hardhat run scripts/base-deployer.js --network base
+      - name: Validate deployment report
+        run: node scripts/write-deployment-report.js deployment-output.json
+      - name: Upload deployment report
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-deployment-report
+          path: deployment-report.json
       - name: Verify on BaseScan
+        if: ${{ success() }}
         env:
-          PRIVATE_KEY: \${{ secrets.PRIVATE_KEY }}
-        run: npx hardhat verify --network base <DEPLOYED_ADDRESS> "$UI_URI" "$MCP_ENDPOINT"
-
-      - name: Log deployment + verification report
-        run: |
-          echo "Log: address / tx / block / timestamp / score"
-          echo "Pin verification report to IPFS"
-          echo "Append entry to S-C Storage Agent log"
-          echo "Update Base Grants R2 proof page"
+          BASESCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+        run: echo "Run verification with the reviewed deployment address from the deployment artifact."
+        # Replace this placeholder only after the deploy script writes a signed artifact.
+        # npx hardhat verify --network base <DEPLOYED_ADDRESS> "$UI_URI" "$MCP_ENDPOINT"
 `;function yn({id:e,title:t,subtitle:n,code:r,lang:l,onCopy:i,copied:o}){return h("section",{className:"glass rounded-[22px] overflow-hidden",children:[h("div",{className:"flex flex-wrap items-start justify-between gap-3 px-4 sm:px-5 py-4 border-b border-[var(--line)]",children:[h("div",{className:"min-w-0",children:[h("div",{className:"flex items-center gap-2",children:[c(Er,{size:18,className:"text-[#FFD97A] shrink-0"}),c("h3",{className:"font-display font-bold text-lg sm:text-xl leading-tight",children:t})]}),n&&c("p",{className:"text-xs sm:text-sm opacity-80 mt-1",children:n})]}),c("button",{onClick:()=>i(e,r),className:"inline-flex items-center gap-2 rounded-full bg-[#D4AF37] px-4 py-2 text-sm font-bold text-[#231600] hover:bg-white focus:outline-none focus:ring-2 focus:ring-white","aria-label":`Copy ${t}`,children:o===e?h(jl,{children:[c(Ee,{size:16})," Copied"]}):h(jl,{children:[c(gr,{size:16})," Copy code"]})})]}),c("div",{className:"bg-[var(--code-bg)] text-[#D8F5E4]",children:c("pre",{className:"code p-4 sm:p-5 text-[11px] sm:text-[12.5px] leading-relaxed max-h-[520px] overflow-auto",children:r})}),h("div",{className:"px-4 py-2 text-[11px] uppercase tracking-[0.18em] opacity-70 flex justify-between",children:[c("span",{children:l}),c("span",{children:"Local draft • review before deploy"})]})]})}function Ea(){let[e,t]=Lt.useState(""),[n,r]=Lt.useState("Aegis"),[l,i]=Lt.useState(["Read v3 contract"]),[o,a]=Lt.useState(0),[u,p]=Lt.useState(0),[v,g]=Lt.useState([]),y=(d)=>g((w)=>w.includes(d)?w.filter((C)=>C!==d):[...w,d]),S=[{name:"Test",detail:"Compile, then run all 6 Hardhat tests. Every test must pass. If any test fails, the loop stops here — nothing deploys.",rule:"TEST FAILS → STOP"},{name:"Deploy",detail:"Only after a green suite, deploy MuSeHybridSuperAgentV3.sol to Base Mainnet (8453) with the deployer wallet loaded from GitHub Secrets.",rule:"DEPLOY ONLY ON GREEN TESTS"},{name:"Verify",detail:"Verify the deployed contract on BaseScan automatically, then create the ERC-6551 Token Bound Account and test verifySuperiorVoice.",rule:"VERIFY FAILS → RETRY, THEN ALERT"},{name:"Log",detail:"Record deployment address, transaction hash, block, timestamp, and score. Write the entry to the S-C Storage Agent log, pin it to IPFS, and generate the verification report.",rule:"EVERY DEPLOY PINS TO IPFS"},{name:"Alert",detail:"If verification still fails after 2 automatic retries, pause the workflow and alert the owner. A successful run updates the Full Build HTML and the Base Grants R2 proof page.",rule:"2 RETRIES → PAUSE + ALERT"}],E=[{name:"PRIVATE_KEY",detail:"Deployer wallet key. GitHub Secrets only. Never in code, screenshots, logs, or chat."},{name:"BASESCAN_API_KEY",detail:"Used by the automatic BaseScan verification step after deploy."},{name:"RPC_URL",detail:"https://mainnet.base.org — Base Mainnet RPC for Hardhat and the deploy script."}],x=(d,w)=>{let C=document.createElement("textarea");C.value=w,C.style.position="fixed",C.style.opacity="0",document.body.appendChild(C),C.select();try{document.execCommand("copy"),t(d)}catch(_){}document.body.removeChild(C),window.setTimeout(()=>t((_)=>_===d?"":_),2200)},M=(d)=>i((w)=>w.includes(d)?w.filter((C)=>C!==d):[...w,d]),f=[{name:"Kleine",price:"$2.99",unit:"one-time spark",blurb:"A first taste of the portal — one fused name, one manifesto, one keepsake.",features:["1 Hybrid Agent draft","Manifesto preview","Emerald + Rose theme"]},{name:"Aegis",price:"$19.99",unit:"/ month",blurb:"The everyday guardian tier. Keep creating, verifying, and refining.",features:["Monthly agent studio","Voice verification drafts","Pause & safety controls","Priority layout updates"]},{name:"Sovereign",price:"$1,499",unit:"/ year",blurb:"The full principal tier. Sovereign identity, deeper orchestration, annual rhythm.",features:["Everything in Aegis","ERC-6551 + ERC-4337 flows","Annual masterpiece review","Sovereign deploy checklist"]},{name:"Enterprise",price:"$4,999",unit:"one-time / scoped",blurb:"For studios and teams that need a named deployment path and review.",features:["Scoped rollout plan","Team review session","Deploy + verify support","Custom onboarding draft"]}],s=f.find((d)=>d.name===n)||f[1],m=[{q:"What does v3 actually fix?",a:"The v3 contract stores the display name, uiURI, and mcpEndpoint together with each fused agent. It starts nextId at 1 so the first masterpiece is #1, not #0."},{q:"Why three standards at once?",a:"ERC-721 gives the agent a collectible identity. ERC-6551 gives that token an account. ERC-4337 lets approved execution run through a standard entry point."},{q:"Is this financial advice or an investment?",a:"No. This page is a product, contract, and grant dossier. Nothing here is financial advice."}];return h("div",{className:"min-h-screen overflow-x-clip bg-[#071512] text-white",style:{paddingTop:"var(--safe-area-inset-top)"},children:[h("div",{"aria-hidden":"true",className:"pointer-events-none fixed inset-0 overflow-hidden",children:[c("div",{className:"absolute -top-28 -left-24 h-[420px] w-[420px] rounded-full bg-[#0B6B4F] opacity-70 blur-[90px]"}),c("div",{className:"absolute top-[34%] -right-32 h-[500px] w-[500px] rounded-full bg-[#6D1A2D] opacity-70 blur-[100px]"}),c("div",{className:"absolute bottom-[-120px] left-[18%] h-[420px] w-[420px] rounded-full bg-[#D4AF37] opacity-25 blur-[100px]"}),c("div",{className:"absolute inset-0 opacity-[0.12]",style:{backgroundImage:"radial-gradient(circle at 1px 1px, #E8B4A0 1px, transparent 0)",backgroundSize:"28px 28px"}})]}),c("header",{className:"sticky z-30 border-b border-white/10 bg-[#071512]/85 backdrop-blur-xl",style:{top:"var(--safe-area-inset-top)"},children:h("div",{className:"mx-auto flex max-w-[1240px] flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6",children:[h("a",{href:"#hero",className:"flex items-center gap-3 min-w-0",children:[c("span",{className:"grid h-10 w-10 shrink-0 place-items-center rounded-full bg-[#D4AF37] text-[#231600] font-display text-xl font-black",children:"Ω"}),h("span",{className:"leading-none",children:[h("span",{className:"block font-display text-base sm:text-lg font-black",children:["OG8OH ",c("span",{className:"text-[#E8B4A0]",children:"Omegaportal"})]}),c("span",{className:"text-[10px] uppercase tracking-[0.24em] text-[#A7E8C8]",children:"OS • ARE YOU FOR REAL? v3"})]})]}),c("nav",{className:"no-scrollbar flex max-w-full gap-1 overflow-x-auto py-1 text-xs sm:text-sm","aria-label":"Page sections",children:Jm.map(([d,w])=>c("a",{href:d,className:"whitespace-nowrap rounded-full px-3 py-2 hover:bg-white/10",children:w},d))})]})}),h("main",{className:"relative mx-auto max-w-[1240px] px-4 pb-16 sm:px-6",children:[h("section",{id:"hero",className:"pt-8 sm:pt-12",children:[h("div",{className:"grid gap-6 lg:grid-cols-[1.55fr_.85fr]",children:[h("div",{children:[h("div",{className:"inline-flex flex-wrap items-center gap-2 rounded-full border border-[#E8B4A0]/40 bg-[#6D1A2D]/50 px-3 py-1.5 text-[11px] sm:text-xs font-semibold tracking-wide",children:[c(yt,{size:14,className:"text-[#FFD97A]"}),c("span",{children:"HELLO, BASE GRANTS — ROUND 2"}),c("span",{className:"hidden sm:inline opacity-60",children:"•"}),c("span",{className:"text-[#E8B4A0]",children:"FULL BUILD • v3"})]}),h("h1",{className:"font-display mt-5 text-[clamp(2.6rem,7vw,5.4rem)] font-black leading-[0.9] tracking-tight",children:["OG8OH",c("br",{}),c("span",{className:"gold-text",children:"Omegaportal OS"}),c("br",{}),c("span",{className:"text-[clamp(1.4rem,3.5vw,2.8rem)] text-[#E8B4A0]",children:"ARE YOU FOR REAL? v3"})]}),c("p",{className:"mt-5 max-w-[720px] text-base sm:text-lg leading-relaxed text-[#E9D9D0]",children:"One sovereign portal. One fused voice. One masterpiece — carried from a single name into a Base-native identity, account, and execution path."}),h("div",{className:"mt-6 flex flex-wrap gap-3",children:[h("a",{href:"#contract",className:"inline-flex items-center gap-2 rounded-full bg-[#D4AF37] px-5 py-3 font-bold text-[#231600] hover:bg-white",children:["Read the v3 contract ",c(hr,{size:17})]}),h("a",{href:"#grants",className:"inline-flex items-center gap-2 rounded-full border border-white/30 px-5 py-3 font-bold hover:bg-white/10",children:["Base Grants R2 ",c(Sr,{size:16})]})]}),c("div",{className:"mt-7 grid grid-cols-2 gap-3 sm:grid-cols-4",children:[["Level 5","Principal Sovereign Architect"],["98.8 / 100","Sovereign score"],["8453","Base L2 chain"],["v3","Contract generation"]].map(([d,w])=>h("div",{className:"rounded-2xl border border-white/10 bg-black/20 p-3",children:[c("div",{className:"font-display text-lg sm:text-xl font-black text-[#FFD97A]",children:d}),c("div",{className:"text-[11px] leading-snug opacity-75",children:w})]},w))})]}),h("aside",{className:"glass rounded-[28px] p-5 sm:p-6",children:[h("div",{className:"flex items-center justify-between",children:[h("span",{className:"inline-flex items-center gap-2 text-xs font-bold uppercase tracking-[0.18em] text-[#A7E8C8]",children:[c(wr,{size:15})," Sovereign identity"]}),c("span",{className:"rounded-full bg-[#0B6B4F] px-2 py-1 text-[10px] font-bold",children:"VERIFIED DRAFT"})]}),c("h2",{className:"font-display mt-5 text-3xl font-black leading-tight",children:"Dexter Vann"}),h("p",{className:"mt-2 text-sm leading-relaxed opacity-85",children:["Vann Family Ventures LLC",c("br",{}),"VannDiamond Base Studios"]}),h("div",{className:"mt-5 space-y-3",children:[h("div",{className:"rounded-xl bg-black/25 p-3",children:[c("div",{className:"text-[11px] uppercase tracking-widest opacity-60",children:"Role"}),c("div",{className:"font-semibold",children:"Level 5 Principal Sovereign Architect"})]}),h("div",{className:"rounded-xl bg-black/25 p-3",children:[c("div",{className:"text-[11px] uppercase tracking-widest opacity-60",children:"Score"}),h("div",{className:"font-display text-2xl font-black",children:["98.8",c("span",{className:"text-base text-[#E8B4A0]",children:" / 100"})]}),c("div",{className:"mt-2 h-2 overflow-hidden rounded-full bg-white/15",children:c("div",{className:"h-full w-[98.8%] rounded-full bg-gradient-to-r from-[#0B6B4F] via-[#D4AF37] to-[#E8B4A0]"})})]}),h("div",{className:"rounded-xl bg-[#6D1A2D]/50 p-3 text-sm",children:[c("strong",{children:"Hello, Base Grants Round 2."}),c("br",{}),c("span",{className:"opacity-80",children:"This is the complete v3 dossier — contract, tests, README, studio, deploy, and pricing in one scroll."})]})]})]})]}),c("div",{className:"mt-6 flex flex-wrap items-center gap-2 text-xs sm:text-sm",children:["ERC-721","ERC-6551","ERC-4337","Ownable","Pausable","ReentrancyGuard"].map((d)=>c("span",{className:"rounded-full border border-[#E8B4A0]/30 bg-[#0B6B4F]/25 px-3 py-1.5 font-semibold",children:d},d))})]}),h("section",{id:"contract",className:"mt-16 scroll-mt-24 sm:mt-24",children:[h("div",{className:"flex flex-wrap items-end justify-between gap-4",children:[h("div",{children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"02 — The contract"}),h("h2",{className:"font-display mt-2 text-3xl sm:text-5xl font-black leading-none",children:["v3, built for",c("br",{}),c("span",{className:"gold-text",children:"one clear truth."})]})]}),c("p",{className:"max-w-md text-sm leading-relaxed opacity-80",children:"Every fused agent keeps its name, its interface, and its MCP endpoint. No hidden defaults. No lost metadata."})]}),c("div",{className:"mt-7 grid gap-4 md:grid-cols-3",children:[{icon:c(vn,{}),t:"Stored together",d:"Name, uiURI, and mcpEndpoint are stored on the agent record at fusion time."},{icon:c(_r,{}),t:"Guarded execution",d:"Ownable controls config, pause, and 4337 execution. ReentrancyGuard protects fusion."},{icon:c(Rr,{}),t:"Clean first token",d:"nextId starts at 1. The first masterpiece is #1 — always."}].map((d)=>h("article",{className:"glass rounded-3xl p-5",children:[c("div",{className:"grid h-11 w-11 place-items-center rounded-full bg-[#D4AF37] text-[#231600]",children:d.icon}),c("h3",{className:"font-display mt-4 text-xl font-bold",children:d.t}),c("p",{className:"mt-2 text-sm leading-relaxed opacity-80",children:d.d})]},d.t))}),h("div",{className:"mt-4 grid gap-3 sm:grid-cols-2",children:[h("div",{className:"rounded-2xl border border-white/10 bg-black/25 p-4",children:[c("div",{className:"text-xs uppercase tracking-widest opacity-60",children:"ERC-6551 Registry"}),c("code",{className:"mt-2 block break-all text-sm text-[#FFD97A]",children:"0x000000006551c19487814612e58FE068137A5fF6a14B"})]}),h("div",{className:"rounded-2xl border border-white/10 bg-black/25 p-4",children:[c("div",{className:"text-xs uppercase tracking-widest opacity-60",children:"ERC-4337 EntryPoint"}),c("code",{className:"mt-2 block break-all text-sm text-[#FFD97A]",children:"0x5FF137D4b0FDCD49DcA30c7CF57E578a026d278a"})]})]}),c("div",{className:"mt-4",children:c(yn,{id:"solidity",title:"MuSeHybridSuperAgentV3.sol",subtitle:"Full v3 Solidity — review the guards, constants, and events before deploying.",code:Km,lang:"Solidity • ^0.8.24",onCopy:x,copied:e})}),c("div",{className:"mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-4",children:["fuseHybridAgent","verifySuperiorVoice","executeVia4337","getMasterpieceManifesto"].map((d,w)=>h("div",{className:"rounded-2xl border border-white/10 bg-[#6D1A2D]/25 p-4",children:[h("span",{className:"text-xs text-[#FFD97A]",children:["0",w+1]}),c("h3",{className:"mt-1 break-words font-mono text-sm font-bold",children:d}),c("p",{className:"mt-1 text-xs opacity-70",children:w===0?"Mints + binds identity":w===1?"Marks voice verified":w===2?"Owner-only EntryPoint call":"Returns the public manifesto"})]},d))})]}),h("section",{id:"tests",className:"mt-16 sm:mt-24",children:[h("div",{className:"flex flex-wrap items-end justify-between gap-4",children:[h("div",{children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"03 — Proof before promise"}),h("h2",{className:"font-display mt-2 text-3xl sm:text-5xl font-black",children:["Six tests.",c("br",{}),"One green suite."]})]}),h("div",{className:"rounded-2xl bg-[#0B6B4F] px-4 py-3 font-mono text-sm",children:[c("span",{className:"opacity-70",children:"$"})," npx hardhat test"]})]}),c("div",{className:"mt-6 grid gap-2 sm:grid-cols-2 lg:grid-cols-3",children:["nextId starts at 1","Fuse + compress 1000","ERC-721 mint","Superior voice verify","Pause blocks fusion","Only owner can call 4337"].map((d,w)=>h("button",{onClick:()=>a(w),className:`rounded-2xl border p-4 text-left transition ${o===w?"border-[#D4AF37] bg-[#D4AF37]/15":"border-white/10 bg-black/20 hover:bg-white/5"}`,children:[h("span",{className:"text-xs text-[#FFD97A]",children:["TEST ",w+1]}),h("span",{className:"mt-1 flex items-center justify-between gap-2 font-semibold",children:[d,c(yr,{size:16})]}),o===w&&c("span",{className:"mt-2 block text-sm opacity-75",children:m[w%3].a})]},d))}),c("div",{className:"mt-4",children:c(yn,{id:"tests",title:"test/MuSeHybridSuperAgentV3.test.js",subtitle:"Six focused tests for identity, compression, voice, pause, and owner-only execution.",code:Xm,lang:"Hardhat • Chai • Ethers",onCopy:x,copied:e})})]}),c("section",{id:"grants",className:"mt-16 sm:mt-24",children:h("div",{className:"glass overflow-hidden rounded-[28px]",children:[h("div",{className:"grid lg:grid-cols-[.9fr_1.1fr]",children:[h("div",{className:"bg-[#6D1A2D] p-6 sm:p-8",children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"04 — Base Grants R2 README"}),h("h2",{className:"font-display mt-3 text-4xl sm:text-5xl font-black leading-[0.95]",children:["Built on Base.",c("br",{}),"Built to last."]}),c("p",{className:"mt-4 text-sm leading-relaxed opacity-85",children:"OG8OH turns one name and one voice into a portable sovereign agent — not a locked profile, not a disposable prompt."}),c("div",{className:"mt-6 flex flex-wrap gap-2",children:["Base L2 • 8453","Onchain identity","Creator-first"].map((d)=>c("span",{className:"rounded-full bg-black/25 px-3 py-1.5 text-xs font-bold",children:d},d))})]}),c("div",{className:"p-6 sm:p-8",children:h("div",{className:"space-y-5",children:[h("div",{children:[c("h3",{className:"font-display text-xl font-bold text-[#FFD97A]",children:"Problem"}),c("p",{className:"mt-1 text-sm leading-relaxed opacity-85",children:"Creators lose continuity. Names, voices, and work scatter across apps that can pause, hide, or reset identity without warning."})]}),h("div",{children:[c("h3",{className:"font-display text-xl font-bold text-[#FFD97A]",children:"Solution"}),c("p",{className:"mt-1 text-sm leading-relaxed opacity-85",children:"Fuse one agent on Base: an ERC-721 identity, an ERC-6551 account, and ERC-4337 execution — with a manifesto anyone can read."})]}),h("div",{children:[c("h3",{className:"font-display text-xl font-bold text-[#FFD97A]",children:"Architecture"}),c("p",{className:"mt-1 text-sm leading-relaxed opacity-85",children:"AI Studio collects the name and endpoints → Hardhat compiles and tests v3 → Base deployer publishes the contract → Android + web read the same agent record."})]}),h("div",{children:[c("h3",{className:"font-display text-xl font-bold text-[#FFD97A]",children:"Why Base"}),c("p",{className:"mt-1 text-sm leading-relaxed opacity-85",children:"Base gives creators a fast, low-friction L2 home with standard 6551 and 4337 infrastructure — chain 8453, no custom chain required."})]})]})})]}),c("div",{className:"grid gap-3 p-5 sm:p-6 md:grid-cols-3 border-t border-white/10",children:[["Milestone 1","Contract + tests","Compile v3. Six Hardhat tests green."],["Milestone 2","Studio + deploy","AI Studio flow and Base deployer verified."],["Milestone 3","Public pilot","One end-to-end fused agent on Base."]].map(([d,w,C])=>h("div",{children:[c("div",{className:"text-xs font-bold uppercase tracking-widest text-[#E8B4A0]",children:d}),c("h3",{className:"mt-1 font-bold",children:w}),c("p",{className:"mt-1 text-sm opacity-75",children:C})]},d))}),h("div",{className:"flex flex-wrap gap-3 border-t border-white/10 p-5 sm:p-6",children:[c("a",{href:"#studio",className:"rounded-full bg-[#D4AF37] px-4 py-2 text-sm font-bold text-[#231600]",children:"Open AI Studio steps"}),c("a",{href:"#deploy",className:"rounded-full border border-white/25 px-4 py-2 text-sm font-bold",children:"Open deploy steps"}),c("span",{className:"self-center text-xs opacity-70",children:"Links stay inside this dossier — no external submission is sent from this page."})]})]})}),h("section",{id:"studio",className:"mt-16 sm:mt-24 grid gap-5 lg:grid-cols-2",children:[h("div",{children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"05 — AI Studio"}),c("h2",{className:"font-display mt-2 text-3xl sm:text-4xl font-black leading-tight",children:"Start with a welcome, not a wallet."}),c("p",{className:"mt-3 text-sm leading-relaxed opacity-80",children:"Copy the studio instructions into a local draft. Keep the name exact, keep Base 8453 as the production network, and do not publish until tests pass."}),c("div",{className:"mt-4",children:c(yn,{id:"studio",title:"aistudio.txt",subtitle:"Name, welcome message, and setup instructions.",code:Zm,lang:"AI Studio • Local draft",onCopy:x,copied:e})})]}),h("div",{id:"deploy",children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"06 — Android + Base Deployer"}),c("h2",{className:"font-display mt-2 text-3xl sm:text-4xl font-black leading-tight",children:"Deploy the same agent, everywhere."}),c("p",{className:"mt-3 text-sm leading-relaxed opacity-80",children:"Use the same uiURI and mcpEndpoint across Android and web. Check each step as you review it locally."}),c("div",{className:"mt-4 space-y-2",children:["Read v3 contract","Run: npx hardhat test","Set UI_URI + MCP_ENDPOINT","Deploy to Base (8453)","Verify contract on Base"].map((d)=>h("button",{onClick:()=>M(d),className:"flex w-full items-center gap-3 rounded-2xl border border-white/10 bg-black/20 p-3 text-left hover:bg-white/5",children:[c("span",{className:`grid h-6 w-6 shrink-0 place-items-center rounded-full border ${l.includes(d)?"bg-[#D4AF37] text-black border-[#D4AF37]":"border-white/30"}`,children:l.includes(d)&&c(Ee,{size:15})}),c("span",{className:`text-sm font-semibold ${l.includes(d)?"line-through opacity-60":""}`,children:d})]},d))}),c("div",{className:"mt-4",children:c(yn,{id:"deployer",title:"base-deployer.js",subtitle:"Deploy + verify steps for Base chain 8453.",code:qm,lang:"Hardhat • Base 8453",onCopy:x,copied:e})}),h("div",{className:"mt-3 flex items-center gap-3 rounded-2xl bg-[#0B6B4F]/40 p-4",children:[c(Pr,{className:"shrink-0 text-[#A7E8C8]"}),h("p",{className:"text-sm leading-relaxed",children:[c("strong",{children:"Android note:"})," Ship the same read-only agent view first — manifesto, token ID, account, and status. Keep deployment in the reviewed Hardhat flow."]})]})]})]}),h("section",{id:"pricing",className:"mt-16 sm:mt-24",children:[h("div",{className:"flex flex-wrap items-end justify-between gap-4",children:[h("div",{children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"07 — Choose your rhythm"}),c("h2",{className:"font-display mt-2 text-3xl sm:text-5xl font-black",children:"Price tiers"})]}),c("p",{className:"max-w-md text-sm opacity-80",children:"Select a tier to preview what it includes. This page shows pricing only — it does not start a checkout."})]}),c("div",{className:"mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4",children:f.map((d)=>h("button",{onClick:()=>r(d.name),className:`rounded-[24px] border p-5 text-left transition ${n===d.name?"border-[#D4AF37] bg-[#6D1A2D]/45 shadow-[0_20px_50px_rgba(0,0,0,.3)]":"border-white/10 bg-black/20 hover:bg-white/5"}`,children:[h("div",{className:"flex items-center justify-between",children:[c("span",{className:"font-display text-xl font-black",children:d.name}),c(Nr,{size:18,className:"text-[#FFD97A]"})]}),h("div",{className:"mt-4",children:[c("span",{className:"font-display text-3xl font-black",children:d.price}),c("span",{className:"ml-1 text-sm opacity-70",children:d.unit})]}),c("p",{className:"mt-2 text-sm leading-relaxed opacity-80",children:d.blurb}),c("span",{className:"mt-4 inline-block text-xs font-bold uppercase tracking-widest text-[#FFD97A]",children:n===d.name?"Selected preview →":"Select preview →"})]},d.name))}),h("div",{className:"mt-4 rounded-[24px] border border-[#D4AF37]/40 bg-[#071512]/80 p-5 sm:p-6",children:[h("div",{className:"flex flex-wrap items-center justify-between gap-3",children:[h("h3",{className:"font-display text-2xl font-black",children:[s.name," — ",h("span",{className:"gold-text",children:[s.price," ",s.unit]})]}),c("span",{className:"rounded-full bg-[#D4AF37] px-3 py-1 text-xs font-bold text-[#231600]",children:"PREVIEW ONLY"})]}),c("ul",{className:"mt-4 grid gap-2 sm:grid-cols-2",children:s.features.map((d)=>h("li",{className:"flex gap-2 text-sm",children:[c(Ee,{size:17,className:"mt-0.5 shrink-0 text-[#A7E8C8]"}),d]},d))})]})]}),c("section",{className:"mt-12 grid gap-3 md:grid-cols-3",children:m.map((d)=>h("article",{className:"rounded-3xl border border-white/10 bg-black/20 p-5",children:[c("h3",{className:"font-display text-lg font-bold",children:d.q}),c("p",{className:"mt-2 text-sm leading-relaxed opacity-80",children:d.a})]},d.q))}),h("section",{id:"manus",className:"mt-16 scroll-mt-24 sm:mt-24",children:[c("div",{className:"glass overflow-hidden rounded-[28px]",children:h("div",{className:"grid lg:grid-cols-[1.05fr_.95fr]",children:[h("div",{className:"bg-[#6D1A2D] p-6 sm:p-8",children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"08 — Manus Automated Workflow"}),h("h2",{className:"font-display mt-3 text-3xl sm:text-5xl font-black leading-[0.95]",children:["Autonomous Smart Contract Deployment ",c("span",{className:"gold-text",children:"on Base Mainnet."})]}),c("p",{className:"mt-4 text-sm sm:text-base leading-relaxed opacity-90",children:"One guarded loop. Tests must pass before anything deploys. Verification must succeed before anything is called done. Every run leaves a log, a pin, and a proof page."}),c("div",{className:"mt-6 grid grid-cols-2 gap-3",children:[["MuSeHybridSuperAgentV3.sol","Project"],["Base Mainnet • 8453","Chain"],["Vann Family Ventures LLC","Owner"],["Dexter Vann","Principal"]].map(([d,w])=>h("div",{className:"rounded-2xl bg-black/25 p-3",children:[c("div",{className:"font-display text-base sm:text-lg font-black leading-tight break-words",children:d}),c("div",{className:"mt-1 text-[11px] uppercase tracking-widest opacity-70",children:w})]},w))}),c("div",{className:"mt-5 flex flex-wrap gap-2",children:["Hardhat","ethers.js","Base RPC","BaseScan API"].map((d)=>c("span",{className:"rounded-full bg-black/25 px-3 py-1.5 text-xs font-bold",children:d},d))})]}),h("div",{className:"p-6 sm:p-8",children:[h("div",{className:"flex items-center gap-2 text-xs font-bold uppercase tracking-[0.18em] text-[#A7E8C8]",children:[c(vr,{size:16})," What the workflow must do"]}),h("ul",{className:"mt-4 space-y-3 text-sm leading-relaxed",children:[h("li",{className:"flex gap-2",children:[c(Ee,{size:17,className:"mt-0.5 shrink-0 text-[#A7E8C8]"}),"Compile, then run the 6 Hardhat tests — deploy is blocked until they pass."]}),h("li",{className:"flex gap-2",children:[c(Ee,{size:17,className:"mt-0.5 shrink-0 text-[#A7E8C8]"}),"Deploy from the deployer wallet loaded from env ",c("code",{className:"break-all font-mono text-[#FFD97A]",children:"PRIVATE_KEY"}),", then verify on BaseScan automatically."]}),h("li",{className:"flex gap-2",children:[c(Ee,{size:17,className:"mt-0.5 shrink-0 text-[#A7E8C8]"}),"Create the ERC-6551 Token Bound Account and test ",c("code",{className:"font-mono text-[#FFD97A]",children:"verifySuperiorVoice"}),"."]}),h("li",{className:"flex gap-2",children:[c(Ee,{size:17,className:"mt-0.5 shrink-0 text-[#A7E8C8]"}),"Auto-retry 2×, then pause and alert. Generate the Base Grants R2 proof page."]})]}),h("div",{className:"mt-5 rounded-2xl bg-[#0B6B4F]/40 p-4",children:[h("div",{className:"flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-[#FFD97A]",children:[c(vn,{size:15})," Security rails"]}),c("p",{className:"mt-2 text-sm leading-relaxed opacity-90",children:"Ownable • Pausable • ReentrancyGuard. No private keys in code. Secrets live in GitHub Secrets only."})]}),h("div",{className:"mt-4 rounded-2xl border border-white/10 bg-black/20 p-4",children:[h("div",{className:"flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-[#E8B4A0]",children:[c(kr,{size:15})," Every run logs"]}),h("p",{className:"mt-2 font-mono text-xs sm:text-sm leading-relaxed text-[#FFD97A] break-words",children:["address • tx • block • timestamp • score",c("br",{}),"→ S-C Storage Agent log + IPFS pin"]})]})]})]})}),h("div",{className:"mt-5 grid gap-5 lg:grid-cols-2",children:[c(yn,{id:"manus-prompt",title:"Manus Prompt",subtitle:"Copy this prompt into Manus to build the autonomous workflow.",code:bm,lang:"Manus • Copy-ready prompt",onCopy:x,copied:e}),c(yn,{id:"github-workflow",title:".github/workflows/deploy-base.yml",subtitle:"GitHub Actions workflow — checkout, Node 20, install, compile, test, deploy, verify, log.",code:jm,lang:"GitHub Actions • Base 8453",onCopy:x,copied:e})]}),h("div",{className:"mt-5 grid gap-5 lg:grid-cols-[1.25fr_.75fr]",children:[h("div",{className:"glass rounded-[24px] p-5 sm:p-6",children:[h("div",{className:"flex flex-wrap items-center justify-between gap-3",children:[h("div",{children:[c("p",{className:"text-xs font-bold uppercase tracking-[0.22em] text-[#E8B4A0]",children:"Autonomous loop"}),c("h3",{className:"font-display mt-2 text-2xl sm:text-3xl font-black",children:"Test → Deploy → Verify → Log → Alert"})]}),h("span",{className:"inline-flex items-center gap-2 rounded-full bg-[#0B6B4F] px-3 py-1.5 text-xs font-bold",children:[c(hn,{size:14})," Select a step"]})]}),c("div",{className:"mt-5 flex flex-wrap gap-2",role:"group","aria-label":"Autonomous loop steps",children:S.map((d,w)=>h("button",{onClick:()=>p(w),"aria-pressed":u===w,className:`rounded-full px-4 py-2 text-sm font-bold transition ${u===w?"bg-[#D4AF37] text-[#231600]":"border border-white/20 bg-black/20 hover:bg-white/10"}`,children:[w+1,". ",d.name]},d.name))}),h("div",{className:"mt-4 rounded-2xl bg-black/25 p-4 sm:p-5",children:[h("div",{className:"flex flex-wrap items-center justify-between gap-2",children:[c("h4",{className:"font-display text-xl font-black",children:S[u].name}),c("span",{className:"rounded-full bg-[#6D1A2D] px-3 py-1 text-[11px] font-bold tracking-wide",children:S[u].rule})]}),c("p",{className:"mt-2 text-sm leading-relaxed opacity-85",children:S[u].detail})]}),h("div",{className:"mt-4 grid gap-2 sm:grid-cols-3",children:[h("div",{className:"rounded-2xl border border-[#FFD97A]/40 bg-[#FFD97A]/10 p-3 text-sm",children:[h("strong",{className:"flex items-center gap-1.5",children:[c(gt,{size:15})," Test fails"]}),c("span",{className:"mt-1 block opacity-80",children:"STOP. No deploy, no verify, no log-as-success."})]}),h("div",{className:"rounded-2xl border border-white/10 bg-black/20 p-3 text-sm",children:[h("strong",{className:"flex items-center gap-1.5",children:[c(hn,{size:15})," Verify fails"]}),c("span",{className:"mt-1 block opacity-80",children:"Retry, then alert. Max 2 automatic retries."})]}),h("div",{className:"rounded-2xl border border-white/10 bg-black/20 p-3 text-sm",children:[h("strong",{className:"flex items-center gap-1.5",children:[c(xr,{size:15})," Every deploy"]}),c("span",{className:"mt-1 block opacity-80",children:"Pins to IPFS + updates the Full Build HTML."})]})]})]}),h("div",{className:"rounded-[24px] border border-[#D4AF37]/40 bg-[#071512]/80 p-5 sm:p-6",children:[h("div",{className:"flex items-center justify-between gap-3",children:[h("div",{className:"flex items-center gap-2",children:[c(Cr,{size:18,className:"text-[#FFD97A]"}),c("h3",{className:"font-display text-2xl font-black",children:"Secrets checklist"})]}),h("span",{className:"rounded-full bg-[#D4AF37] px-3 py-1 text-xs font-bold text-[#231600]",children:[v.length," / ",E.length," checked"]})]}),c("p",{className:"mt-2 text-sm leading-relaxed opacity-80",children:"A local review checklist only. Do not type secret values into this page — add them in GitHub Secrets."}),c("div",{className:"mt-4 space-y-2",children:E.map((d)=>c("button",{onClick:()=>y(d.name),"aria-pressed":v.includes(d.name),className:`w-full rounded-2xl border p-3 text-left transition ${v.includes(d.name)?"border-[#D4AF37] bg-[#D4AF37]/15":"border-white/10 bg-black/20 hover:bg-white/5"}`,children:h("span",{className:"flex items-center gap-3",children:[c("span",{className:`grid h-6 w-6 shrink-0 place-items-center rounded-full border ${v.includes(d.name)?"bg-[#D4AF37] text-black border-[#D4AF37]":"border-white/30"}`,children:v.includes(d.name)&&c(Ee,{size:15})}),h("span",{className:"min-w-0",children:[c("span",{className:"block break-words font-mono text-sm font-bold",children:d.name}),c("span",{className:"mt-0.5 block text-xs leading-relaxed opacity-75 break-words",children:d.detail})]})]})},d.name))}),h("div",{className:"mt-4 rounded-2xl bg-[#6D1A2D]/50 p-4 text-sm leading-relaxed",children:[c("strong",{children:"Deliverables to check:"}),c("br",{}),c("span",{className:"opacity-80",children:"GitHub Actions workflow • deploy script • verification report • Base Grants R2 proof page."})]}),c("p",{className:"mt-3 text-xs leading-relaxed opacity-70",children:"Local checklist state only — it is not saved, sent, or stored anywhere."})]})]})]}),h("footer",{className:"mt-16 border-t border-white/10 pt-8",children:[h("div",{className:"flex flex-wrap items-start justify-between gap-6",children:[h("div",{children:[h("div",{className:"font-display text-2xl font-black",children:["OG8OH ",c("span",{className:"text-[#E8B4A0]",children:"Omegaportal OS"})]}),c("p",{className:"mt-1 text-sm opacity-70",children:"ARE YOU FOR REAL? v3 • MuSe Hybrid SuperAgent"})]}),c("div",{className:"flex flex-wrap gap-2",children:["Base L2 • 8453","ERC-721 • 6551 • 4337","© 2026 Vann Family Ventures LLC"].map((d)=>c("span",{className:"rounded-full border border-white/15 px-3 py-1.5 text-xs",children:d},d))})]}),h("div",{className:"mt-6 grid gap-4 text-xs leading-relaxed opacity-70 sm:grid-cols-3",children:[c("p",{children:"© 2026 Vann Family Ventures LLC. All rights reserved. OG8OH, Omegaportal, MuSe, VannDiamond, and related marks are trademarks of Vann Family Ventures LLC."}),c("p",{children:"Not financial advice. Nothing on this page is an offer, solicitation, investment recommendation, or guarantee of future value or performance."}),c("p",{children:"Base L2 • Chain ID 8453. Contract addresses, code, and deploy steps are provided as review drafts. Verify all addresses and code before any onchain action."})]})]})]})]})}pd.createRoot(document.getElementById("root")).render(c(fd.default.StrictMode,{children:c(Ea,{})}));
 </script>
   <script>(function(){function m(a){var h=a.getAttribute("href");if(!h)return;try{var u=new URL(h,document.baseURI);if(((u.protocol==="http:"||u.protocol==="https:")&&u.host!==location.host)||u.protocol==="mailto:"||u.protocol==="tel:"||u.protocol==="sms:"){a.target="_blank";a.rel="noopener noreferrer";}}catch(e){}}function s(){document.querySelectorAll("a[href]").forEach(m);}if(document.readyState!=="loading"){s();}else{document.addEventListener("DOMContentLoaded",s);}document.addEventListener("click",function(e){var a=e.target&&e.target.closest&&e.target.closest("a[href]");if(a){m(a);}},true);})();</script>
